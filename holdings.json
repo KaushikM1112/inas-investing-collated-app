@@ -1,0 +1,38 @@
+[
+  {
+    "Ticker": "QQQ",
+    "Quantity": 2,
+    "CostBasis_AUD": 800,
+    "Notes": "High-growth US tech ETF"
+  },
+  {
+    "Ticker": "NDQ.AX",
+    "Quantity": 5,
+    "CostBasis_AUD": 1500,
+    "Notes": "Nasdaq 100 (AUD)"
+  },
+  {
+    "Ticker": "FAANG",
+    "Quantity": 10,
+    "CostBasis_AUD": 2200,
+    "Notes": "Thematic high beta"
+  },
+  {
+    "Ticker": "BTC-USD",
+    "Quantity": 0.02,
+    "CostBasis_AUD": 1800,
+    "Notes": "Bitcoin"
+  },
+  {
+    "Ticker": "ETH-USD",
+    "Quantity": 0.3,
+    "CostBasis_AUD": 1400,
+    "Notes": "Ethereum"
+  },
+  {
+    "Ticker": "GOLD.AX",
+    "Quantity": 8,
+    "CostBasis_AUD": 2000,
+    "Notes": "GOLD ETF (physical gold exposure)"
+  }
+]
