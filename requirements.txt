@@ -1,7 +1,7 @@
-streamlit>=1.36
-pandas>=2.0
-numpy>=1.24
-yfinance>=0.2.40
-pytz
-gspread>=6.1.2
-google-auth>=2.30.0
+streamlit
+pandas
+numpy
+matplotlib
+yfinance
+gspread
+google-auth

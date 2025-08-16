@@ -1,0 +1,42 @@
+{
+  "base_currency": "AUD",
+  "targets": {
+    "BTC-USD": 20.0,
+    "GOLD.AX": 15.0,
+    "NDQ.AX": 25.0,
+    "IVV.AX": 20.0,
+    "SMALL.AX": 20.0
+  },
+  "positions": [
+    {
+      "ticker": "BTC-USD",
+      "qty": 0.2,
+      "cost_aud": 16000,
+      "type": "crypto"
+    },
+    {
+      "ticker": "GOLD.AX",
+      "qty": 100,
+      "cost_aud": 24000,
+      "type": "gold"
+    },
+    {
+      "ticker": "NDQ.AX",
+      "qty": 80,
+      "cost_aud": 17000,
+      "type": "etf"
+    },
+    {
+      "ticker": "IVV.AX",
+      "qty": 40,
+      "cost_aud": 15000,
+      "type": "etf"
+    },
+    {
+      "ticker": "SMALL.AX",
+      "qty": 300,
+      "cost_aud": 9000,
+      "type": "smallcap"
+    }
+  ]
+}
