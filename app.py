@@ -1,333 +1,599 @@
 
-import os, io, json, time, math, functools, typing as t
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import os
+import json
+import time
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
 
+import streamlit as st
+
+# Optional imports for live data & Google Sheets; app will still run without them.
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-GSPREAD_OK = True
 try:
-    import gspread
-    from google.oauth2 import service_account
+    import gspread  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
 except Exception:
-    GSPREAD_OK = False
+    gspread = None
+    Credentials = None
 
-st.set_page_config(page_title="Investment – Collated Final", layout="wide")
-st.title("📈 Investment Dashboard – Collated Final (with Greedy Planner)")
+# -----------------------------
+# App Config & Constants
+# -----------------------------
+st.set_page_config(
+    page_title="Inas Investing — Collated App",
+    page_icon="📈",
+    layout="wide",
+)
 
-DEFAULT_BASE_CURRENCY = "AUD"
-FX_TICKER_AUDUSD = "AUDUSD=X"
-GOLD_TICKER_USD = "GC=F"
-BTC_TICKER_USD = "BTC-USD"
+DEFAULT_HOLDINGS = [
+    {"Ticker": "QQQ", "Quantity": 2, "CostBasis_AUD": 800, "Notes": "High-growth US tech ETF"},
+    {"Ticker": "NDQ.AX", "Quantity": 5, "CostBasis_AUD": 1500, "Notes": "Nasdaq 100 (AUD)"},
+    {"Ticker": "FAANG", "Quantity": 10, "CostBasis_AUD": 2200, "Notes": "Thematic high beta"},
+    {"Ticker": "BTC-USD", "Quantity": 0.02, "CostBasis_AUD": 1800, "Notes": "Bitcoin"},
+    {"Ticker": "ETH-USD", "Quantity": 0.3, "CostBasis_AUD": 1400, "Notes": "Ethereum"},
+    {"Ticker": "GOLD.AX", "Quantity": 8, "CostBasis_AUD": 2000, "Notes": "GOLD ETF (physical gold exposure)"},
+]
 
-def fmt_money(x, cur="AUD"):
+DEFAULT_TARGETS = {
+    "QQQ": 0.20,
+    "NDQ.AX": 0.20,
+    "FAANG": 0.10,
+    "BTC-USD": 0.20,
+    "ETH-USD": 0.10,
+    "GOLD.AX": 0.20,
+}
+
+APP_SECTIONS = [
+    "Home — Overview & Allocation",
+    "Live Tracker (with Lag Compensation)",
+    "Gold Tracking (Live + Manual)",
+    "Rebalance Advisor",
+    "Alerts",
+    "Data — Edit Holdings / Targets",
+    "Settings — Google Sheets & Persistence",
+    "Help",
+]
+
+LOCAL_HOLDINGS_PATH = "holdings.json"
+LOCAL_ALERTS_PATH = "alerts.json"
+LOCAL_TARGETS_PATH = "targets.json"
+
+# -----------------------------
+# Utility & Persistence
+# -----------------------------
+
+def _now_aware():
+    return datetime.now(timezone.utc)
+
+def load_local_json(path: str, fallback):
     try:
-        return f"{cur} {x:,.2f}"
-    except Exception:
-        return f"{cur} {x}"
-
-def safe_yf_download(ticker, period="1d", interval="1d"):
-    if yf is None:
-        return None
-    try:
-        df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, threads=False, progress=False)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-        return None
-    except Exception:
-        return None
-
-def get_last_price(ticker: str):
-    df = safe_yf_download(ticker, period="5d", interval="1d")
-    if df is None or df.empty:
-        return (float('nan'), "no-data")
-    p = float(df["Close"].dropna().iloc[-1])
-    ts = df.index[-1].to_pydatetime()
-    return (p, ts.strftime("%Y-%m-%d %H:%M UTC"))
-
-def moving_average(series: pd.Series, window: int = 20) -> float:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < window:
-        return float(s.mean()) if len(s) else float('nan')
-    return float(s.tail(window).mean())
-
-def drift_adjust(price: float, hours_since: float, drift_bps_per_hour: float = 2.0) -> float:
-    if not np.isfinite(price) or not np.isfinite(hours_since):
-        return price
-    return price * (1.0 + (drift_bps_per_hour / 10000.0) * hours_since)
-
-@st.cache_data(show_spinner=False)
-def load_local_json():
-    try:
-        with open("holdings.json", "r") as f:
-            return json.load(f)
-    except Exception:
-        try:
-            with open("example_holdings.json", "r") as f:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            return {"base_currency": DEFAULT_BASE_CURRENCY, "targets": {}, "positions": []}
+    except Exception:
+        pass
+    return fallback
 
-def save_local_json(data: dict):
+def save_local_json(path: str, data):
     try:
-        with open("holdings.json", "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         return True
     except Exception:
         return False
 
-def get_gsheet_client():
-    if not GSPREAD_OK:
+def try_read_gsheets(sheet_name="Holdings"):
+    """Read from Google Sheets if configured; else return None.
+
+    Expect Streamlit secrets configured as:
+    [gsheets]
+    sheet_id = "your_google_sheet_id"
+    worksheet = "Holdings"
+
+    [gcp_service_account]
+    type = "service_account"
+    project_id = "..."
+    client_email = "..."
+    private_key = "-----BEGIN PRIVATE KEY-----\n..."
+    """
+    if gspread is None or Credentials is None:
         return None
+
     try:
-        secrets = st.secrets.get("gcp_service_account", None)
-        sheet_key = st.secrets.get("sheet_id", None)
-        if not secrets or not sheet_key:
+        gs_cfg = st.secrets.get("gsheets", {})
+        svc = st.secrets.get("gcp_service_account", None)
+        if not gs_cfg or not svc:
             return None
-        creds = service_account.Credentials.from_service_account_info(dict(secrets), scopes=["https://www.googleapis.com/auth/spreadsheets"])
-        gc = gspread.authorize(creds)
-        return gc, sheet_key
-    except Exception:
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(dict(svc), scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(gs_cfg["sheet_id"])
+        ws = sh.worksheet(gs_cfg.get("worksheet", sheet_name))
+
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        return df
+    except Exception as e:
+        st.sidebar.warning(f"Google Sheets read skipped: {e}")
         return None
 
-def read_from_sheet():
-    cli = get_gsheet_client()
-    if not cli:
-        return None
-    gc, sheet_key = cli
-    try:
-        sh = gc.open_by_key(sheet_key)
-        ws = sh.worksheet("holdings")
-    except Exception:
-        return None
-    rows = ws.get_all_records()
-    pos = []
-    targets = {}
-    base = DEFAULT_BASE_CURRENCY
-    for r in rows:
-        tck = str(r.get("Ticker","")).strip()
-        if not tck:
-            continue
-        qty = float(r.get("Quantity", 0) or 0)
-        cost = float(r.get("CostBasis_AUD", 0) or 0)
-        tgt = r.get("TargetWeight", None)
-        typ = r.get("Type", "")
-        if tgt is not None and tgt != "":
-            targets[tck] = float(tgt)
-        pos.append({"ticker": tck, "qty": qty, "cost_aud": cost, "type": typ})
-    return {"base_currency": base, "targets": targets, "positions": pos}
-
-def write_to_sheet(data: dict):
-    cli = get_gsheet_client()
-    if not cli:
+def try_write_gsheets(df: pd.DataFrame, sheet_name="Holdings"):
+    if gspread is None or Credentials is None:
         return False
-    gc, sheet_key = cli
+
     try:
-        sh = gc.open_by_key(sheet_key)
-        try:
-            ws = sh.worksheet("holdings")
-        except Exception:
-            ws = sh.add_worksheet(title="holdings", rows=200, cols=10)
-        rows = [["Ticker","Quantity","CostBasis_AUD","TargetWeight","Type"]]
-        for p in data.get("positions", []):
-            rows.append([p.get("ticker",""), p.get("qty",0), p.get("cost_aud",0), data.get("targets",{}).get(p.get("ticker",""), ""), p.get("type","")])
+        gs_cfg = st.secrets.get("gsheets", {})
+        svc = st.secrets.get("gcp_service_account", None)
+        if not gs_cfg or not svc:
+            return False
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(dict(svc), scopes=scopes)
+        client = gspread.authorize(creds)
+        sh = client.open_by_key(gs_cfg["sheet_id"])
+        ws = sh.worksheet(gs_cfg.get("worksheet", sheet_name))
+
+        # Clear then update
         ws.clear()
-        ws.update("A1", rows)
+        ws.update([df.columns.values.tolist()] + df.values.tolist())
         return True
-    except Exception:
+    except Exception as e:
+        st.sidebar.warning(f"Google Sheets write skipped: {e}")
         return False
 
-st.sidebar.header("Data Source")
-use_sheets = st.sidebar.checkbox("Use Google Sheets (if configured in secrets)", value=False)
-if st.sidebar.button("Load Holdings"):
-    data = read_from_sheet() if use_sheets else load_local_json()
-    if not data:
-        st.error("Failed to load holdings from the selected source.")
+def get_prices_yf(tickers: List[str]) -> Dict[str, float]:
+    """Fetch latest prices using yfinance. Returns dict {ticker: price}.
+    If yfinance is missing or fails, returns last known or 1.0 fallback.
+    """
+    prices = {}
+    if yf is None:
+        for t in tickers:
+            prices[t] = 1.0
+        return prices
+
+    try:
+        data = yf.download(tickers=tickers, period="1d", interval="1m", group_by="ticker", auto_adjust=True, threads=True, progress=False)
+        # yfinance returns different shapes if single vs multi
+        def last_close(frame):
+            try:
+                if isinstance(frame, pd.DataFrame):
+                    return float(frame["Close"].dropna().iloc[-1])
+            except Exception:
+                pass
+            return np.nan
+
+        if isinstance(data, pd.DataFrame) and "Close" in data.columns:
+            # Single ticker
+            prices[tickers[0]] = float(data["Close"].dropna().iloc[-1])
+        else:
+            # Multi
+            for t in tickers:
+                try:
+                    prices[t] = float(data[t]["Close"].dropna().iloc[-1])
+                except Exception:
+                    prices[t] = np.nan
+
+        # Fallback for NaNs
+        for t in tickers:
+            if math.isnan(prices.get(t, np.nan)):
+                prices[t] = 1.0
+    except Exception:
+        for t in tickers:
+            prices[t] = 1.0
+    return prices
+
+def drift_compensation(prices_ts: List[Tuple[datetime, float]], horizon_minutes: int = 10) -> float:
+    """Very simple linear drift model: recent slope * horizon + last price."""
+    if len(prices_ts) < 2:
+        return prices_ts[-1][1] if prices_ts else 1.0
+    t = np.array([(p[0] - prices_ts[0][0]).total_seconds() / 60.0 for p in prices_ts], dtype=float)
+    y = np.array([p[1] for p in prices_ts], dtype=float)
+    # linear regression slope
+    slope = 0.0
+    try:
+        A = np.vstack([t, np.ones_like(t)]).T
+        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
+        last_t = (prices_ts[-1][0] - prices_ts[0][0]).total_seconds() / 60.0
+        est = slope * (last_t + horizon_minutes) + intercept
+        return float(est)
+    except Exception:
+        return float(y[-1])
+
+# -----------------------------
+# Session State Initialization
+# -----------------------------
+
+if "holdings_df" not in st.session_state:
+    # Try Google Sheets first
+    df_gs = try_read_gsheets("Holdings")
+    if df_gs is not None and set(df_gs.columns) >= {"Ticker", "Quantity"}:
+        st.session_state.holdings_df = df_gs
     else:
-        st.session_state["holdings"] = data
-        st.success("Holdings loaded.")
-if st.sidebar.button("Save Holdings"):
-    data = st.session_state.get("holdings", None)
-    if not data:
-        st.warning("Nothing to save — load or edit first.")
-    else:
-        ok = write_to_sheet(data) if use_sheets else save_local_json(data)
-        st.success("Saved." if ok else "Save failed.")
+        # fallback to local file or defaults
+        holdings = load_local_json(LOCAL_HOLDINGS_PATH, DEFAULT_HOLDINGS)
+        st.session_state.holdings_df = pd.DataFrame(holdings)
 
-holdings = st.session_state.get("holdings", load_local_json())
+if "targets" not in st.session_state:
+    st.session_state.targets = load_local_json(LOCAL_TARGETS_PATH, DEFAULT_TARGETS)
 
-st.subheader("🎯 Targets & Positions")
-c1, c2 = st.columns([2, 3])
-with c1:
-    st.markdown("**Target Allocation (by ticker, %)**")
-    targets = holdings.get("targets", {})
-    editable_targets = [{"Ticker": k, "Target %": v} for k, v in targets.items()]
-    tgt_df = st.data_editor(pd.DataFrame(editable_targets), num_rows="dynamic", use_container_width=True)
-    new_targets = {row["Ticker"]: float(row["Target %"]) for _, row in tgt_df.dropna().iterrows() if str(row["Ticker"]).strip() != ""}
-    s = sum(new_targets.values()) or 1.0
-    new_targets = {k: v/s*100.0 for k, v in new_targets.items()}
-with c2:
-    st.markdown("**Positions**")
-    pos = holdings.get("positions", [])
-    pos_df = st.data_editor(pd.DataFrame(pos), num_rows="dynamic", use_container_width=True)
-    new_positions = pos_df.fillna({"qty":0,"cost_aud":0,"type":""}).to_dict(orient="records")
-holdings["targets"] = new_targets
-holdings["positions"] = new_positions
-st.session_state["holdings"] = holdings
+if "alerts" not in st.session_state:
+    st.session_state.alerts = load_local_json(LOCAL_ALERTS_PATH, {
+        # example alerts
+        "BTC-USD": {"price_above": 120000, "price_below": 80000},
+        "GOLD.AX": {"alloc_above": 0.25, "alloc_below": 0.15},
+    })
 
-st.subheader("💹 Live Prices & Valuation")
-try:
-    FX_TICKER_AUDUSD = "AUDUSD=X"
-    GOLD_TICKER_USD = "GC=F"
-    BTC_TICKER_USD = "BTC-USD"
-    fx_price, fx_ts = get_last_price(FX_TICKER_AUDUSD)
-    gold_usd, gold_ts = get_last_price(GOLD_TICKER_USD)
-    btc_usd, btc_ts = get_last_price(BTC_TICKER_USD)
-except Exception:
-    fx_price, fx_ts, gold_usd, gold_ts, btc_usd, btc_ts = float('nan'), "no-data", float('nan'), "no-data", float('nan'), "no-data"
+if "price_cache" not in st.session_state:
+    st.session_state.price_cache = {}  # {ticker: [(ts, price), ...]}
+if "last_update" not in st.session_state:
+    st.session_state.last_update = None
 
-col_fx, col_opts = st.columns([3,2])
-with col_fx:
-    st.write(f"**AUDUSD** last: {fx_price if np.isfinite(fx_price) else 'n/a'} @ {fx_ts}")
-    audusd = fx_price if np.isfinite(fx_price) and fx_price>0 else float('nan')
-    gold_aud = gold_usd / audusd if np.isfinite(gold_usd) and np.isfinite(audusd) else float('nan')
-    btc_aud = btc_usd / audusd if np.isfinite(btc_usd) and np.isfinite(audusd) else float('nan')
-    st.write(f"**Gold USD**: {gold_usd if np.isfinite(gold_usd) else 'n/a'} | **Gold AUD est**: {gold_aud if np.isfinite(gold_aud) else 'n/a'}")
-    st.write(f"**BTC USD**: {btc_usd if np.isfinite(btc_usd) else 'n/a'} | **BTC AUD est**: {btc_aud if np.isfinite(btc_aud) else 'n/a'}")
-with col_opts:
-    drift_on = st.checkbox("Apply drift model to stale quotes", value=True)
-    drift_bps_per_hour = st.number_input("Drift (bps/hour)", 0.0, 20.0, 2.0, step=0.5)
-    fee_bps = st.number_input("Trading fee (bps)", 0.0, 200.0, 7.0, step=1.0)
-    slippage_bps = st.number_input("Slippage (bps)", 0.0, 200.0, 5.0, step=1.0)
+# -----------------------------
+# Sidebar Navigation
+# -----------------------------
 
-tickers = [p["ticker"] for p in new_positions if str(p.get("ticker","")).strip()]
-unique_tickers = sorted(set([t for t in tickers if t]))
-prices = {}
-timestamps = {}
-for tck in unique_tickers:
-    p, ts = get_last_price(tck)
-    if drift_on and isinstance(ts, str) and "UTC" in ts:
-        try:
-            from datetime import datetime as dt
-            ts_dt = dt.strptime(ts.replace(" UTC",""), "%Y-%m-%d %H:%M")
-            hours = (dt.utcnow() - ts_dt).total_seconds()/3600.0
-            p = drift_adjust(p, hours, drift_bps_per_hour)
-        except Exception:
-            pass
-    prices[tck] = p
-    timestamps[tck] = ts
+st.sidebar.title("📦 Inas Investing — Collated")
+section = st.sidebar.radio("Navigate", APP_SECTIONS, index=0)
+st.sidebar.caption("Tip: Configure Google Sheets in Settings to persist data across sessions.")
 
-rows = []
-for p in new_positions:
-    tck = p.get("ticker","").strip()
-    if not tck:
-        continue
-    qty = float(p.get("qty",0) or 0)
-    cost = float(p.get("cost_aud",0) or 0)
-    typ = p.get("type","")
-    px = prices.get(tck, float('nan'))
-    mkt = qty * (px if np.isfinite(px) else 0.0)
-    rows.append({"Ticker": tck, "Type": typ, "Qty": qty, "Price": px, "MarketValue": mkt, "Cost_AUD": cost})
-val_df = pd.DataFrame(rows)
-total_mv = float(val_df["MarketValue"].sum()) if not val_df.empty else 0.0
-st.dataframe(val_df.fillna("n/a"), use_container_width=True)
-st.metric("Portfolio Market Value", fmt_money(total_mv))
+# -----------------------------
+# Core Computations
+# -----------------------------
 
-st.subheader("🧭 Allocation")
-if not val_df.empty:
-    alloc = val_df.groupby("Ticker")["MarketValue"].sum()
-    alloc_pct = (alloc / max(total_mv, 1)) * 100.0
-    alloc_df = pd.DataFrame({"Ticker": alloc.index, "Weight %": alloc_pct.values}).sort_values("Weight %", ascending=False)
-    st.dataframe(alloc_df, use_container_width=True)
-    fig, ax = plt.subplots()
-    ax.pie(alloc_pct.values, labels=alloc_pct.index, autopct="%1.1f%%")
-    ax.set_title("Portfolio Allocation")
-    st.pyplot(fig)
+def compute_portfolio_values(holdings_df: pd.DataFrame, prices: Dict[str, float]) -> pd.DataFrame:
+    df = holdings_df.copy()
+    df["Price_AUD"] = df["Ticker"].map(prices).fillna(0.0)
+    df["MarketValue_AUD"] = df["Quantity"] * df["Price_AUD"]
+    return df
 
-st.subheader("🔧 Rebalance Advisor")
-tgt_series = pd.Series(new_targets, dtype=float)
-cur_series = alloc_pct if 'alloc_pct' in locals() else pd.Series(dtype=float)
-combined = pd.DataFrame({"Target %": tgt_series, "Current %": cur_series}).fillna(0.0)
-combined["Diff %"] = combined["Target %"] - combined["Current %"]
-st.dataframe(combined.sort_values("Diff %", ascending=True), use_container_width=True)
+def allocation(df: pd.DataFrame) -> pd.Series:
+    total = df["MarketValue_AUD"].sum()
+    if total <= 0:
+        return pd.Series(0, index=df["Ticker"], dtype=float)
+    alloc = df.set_index("Ticker")["MarketValue_AUD"] / total
+    return alloc
 
-st.subheader("🧮 Greedy Planner (fees, slippage, lot sizes, FX)")
-cash_aud = st.number_input("Available cash (AUD)", 0.0, 1e9, 10000.0, step=100.0)
-lot_size = st.number_input("Lot size (min units per trade)", 1, 10000, 1, step=1)
-if st.button("Plan Buys"):
-    import math
-    desired_weights = combined["Target %"] / combined["Target %"].sum()
-    desired_values = desired_weights * (total_mv + cash_aud)
-    current_values = (cur_series / 100.0) * total_mv
-    gap = (desired_values - current_values).fillna(0.0)
-    plan = []
-    prices_vec = {t: prices.get(t, float('nan')) for t in desired_weights.index}
-    fees = fee_bps / 10000.0
-    slip = slippage_bps / 10000.0
-    remaining_cash = cash_aud
-    safety = 20000
-    while remaining_cash > 0 and safety > 0:
-        safety -= 1
-        if gap.empty or gap.max() <= 0:
-            break
-        tgt = gap.sort_values(ascending=False).index[0]
-        px = prices_vec.get(tgt, float('nan'))
-        if not np.isfinite(px) or px <= 0:
-            gap[tgt] = 0
+def rebalance_suggestions(current_alloc: pd.Series, targets: Dict[str, float], df_values: pd.DataFrame, threshold: float = 0.02) -> pd.DataFrame:
+    # Merge current vs target
+    idx = sorted(set(current_alloc.index).union(targets.keys()))
+    out = pd.DataFrame(index=idx, columns=["Target", "Current", "Diff", "Action", "Qty_Adjust"])
+    out["Target"] = [targets.get(i, 0.0) for i in idx]
+    out["Current"] = [float(current_alloc.get(i, 0.0)) for i in idx]
+    out["Diff"] = out["Current"] - out["Target"]
+
+    # Suggest buy/sell for those exceeding threshold
+    total_mv = df_values["MarketValue_AUD"].sum()
+    px_map = df_values.set_index("Ticker")["Price_AUD"].to_dict()
+    qty_map = df_values.set_index("Ticker")["Quantity"].to_dict()
+
+    for i in idx:
+        diff = float(out.loc[i, "Diff"])
+        if abs(diff) < threshold:
+            out.loc[i, "Action"] = "OK"
+            out.loc[i, "Qty_Adjust"] = 0.0
             continue
-        unit_cost = px * (1 + fees + slip)
-        qty = max(0, int(min(remaining_cash // unit_cost, math.ceil((gap[tgt] / unit_cost)))))
-        qty = (qty // lot_size) * lot_size
-        if qty <= 0:
-            break
-        spend = qty * unit_cost
-        remaining_cash -= spend
-        gap[tgt] -= spend
-        plan.append({"Ticker": tgt, "Qty": qty, "EstPrice": px, "EstSpend": spend})
-    plan_df = pd.DataFrame(plan)
-    if plan_df.empty:
-        st.info("No feasible buys with current cash/lot size/fees.")
+        action = "Sell" if diff > 0 else "Buy"
+        delta_value = (-diff) * total_mv  # how much value to add/remove
+        price = float(px_map.get(i, 0.0)) or 1.0
+        qty_adj = delta_value / price
+        out.loc[i, "Action"] = action
+        out.loc[i, "Qty_Adjust"] = round(qty_adj, 4)
+
+    return out
+
+def evaluate_alerts(df_values: pd.DataFrame, targets: Dict[str, float], alerts: Dict) -> List[str]:
+    notes = []
+    if df_values.empty: 
+        return notes
+
+    prices = df_values.set_index("Ticker")["Price_AUD"].to_dict()
+    allocs = allocation(df_values)
+
+    for tkr, cfg in alerts.items():
+        if not isinstance(cfg, dict): 
+            continue
+        p = prices.get(tkr)
+        a = float(allocs.get(tkr, 0.0))
+
+        if p is not None:
+            if "price_above" in cfg and p > cfg["price_above"]:
+                notes.append(f"⚠️ {tkr} price crossed above {cfg['price_above']:.2f} (now {p:.2f})")
+            if "price_below" in cfg and p < cfg["price_below"]:
+                notes.append(f"⚠️ {tkr} price fell below {cfg['price_below']:.2f} (now {p:.2f})")
+
+        if "alloc_above" in cfg and a > cfg["alloc_above"]:
+            notes.append(f"⚠️ {tkr} allocation above {cfg['alloc_above']*100:.1f}% (now {a*100:.1f}%)")
+        if "alloc_below" in cfg and a < cfg["alloc_below"]:
+            notes.append(f"⚠️ {tkr} allocation below {cfg['alloc_below']*100:.1f}% (now {a*100:.1f}%)")
+
+    return notes
+
+def maybe_fetch_prices(holdings_df: pd.DataFrame, force: bool = False) -> Dict[str, float]:
+    tickers = sorted(set(holdings_df["Ticker"].dropna().astype(str).tolist()))
+    prices = {}
+
+    needs_update = force
+    if st.session_state.last_update is None:
+        needs_update = True
     else:
-        st.dataframe(plan_df, use_container_width=True)
-        st.metric("Cash leftover", fmt_money(remaining_cash))
-        csv_buf = io.StringIO(); plan_df.to_csv(csv_buf, index=False)
-        st.download_button("⬇️ Download plan CSV", data=csv_buf.getvalue(), file_name="buy_plan.csv", mime="text/csv")
+        # consider stale if > 5 minutes
+        if (_now_aware() - st.session_state.last_update) > timedelta(minutes=5):
+            needs_update = True
 
-st.subheader("🚨 Alerts")
-alert_rows = []
-ma_window = st.number_input("MA window (days)", 5, 200, 20)
-for tck in sorted(set([p.get("ticker","") for p in new_positions if p.get("ticker","")])):
-    df = safe_yf_download(tck, period="90d", interval="1d")
-    if df is None or df.empty:
-        continue
-    last = float(df["Close"].dropna().iloc[-1])
-    ma = moving_average(df["Close"], ma_window)
-    cur_w = float(alloc_pct.get(tck, 0.0)) if 'alloc_pct' in locals() else 0.0
-    tgt_w = new_targets.get(tck, 0.0)
-    alert_rows.append({"Ticker": tck, "Last": last, f"MA{ma_window}": ma, "AboveMA": last>ma if np.isfinite(ma) else None, "AllocDrift %": cur_w - tgt_w})
-if alert_rows:
-    st.dataframe(pd.DataFrame(alert_rows), use_container_width=True)
+    if needs_update:
+        new_prices = get_prices_yf(tickers)
+        now = _now_aware()
+        for t, px in new_prices.items():
+            st.session_state.price_cache.setdefault(t, [])
+            st.session_state.price_cache[t].append((now, float(px)))
+            # keep only last 50 points
+            st.session_state.price_cache[t] = st.session_state.price_cache[t][-50:]
+        st.session_state.last_update = now
 
-st.subheader("🗂️ Import / Export")
-cE1, cE2 = st.columns(2)
-with cE1:
-    if st.button("Export JSON"):
-        buf = io.StringIO(); json.dump(holdings, buf, indent=2)
-        st.download_button("⬇️ Download holdings.json", data=buf.getvalue(), file_name="holdings.json", mime="application/json")
-with cE2:
-    up = st.file_uploader("Import holdings.json", type=["json"])
-    if up is not None:
-        try:
-            new = json.load(up)
-            st.session_state["holdings"] = new
-            st.success("Imported into session. Use sidebar 'Save Holdings' to persist.")
-        except Exception as e:
-            st.error(f"Import failed: {e}")
+    # Use last known prices
+    for t in tickers:
+        hist = st.session_state.price_cache.get(t, [])
+        prices[t] = hist[-1][1] if hist else 1.0
+
+    return prices
+
+# -----------------------------
+# UI Sections
+# -----------------------------
+
+def ui_header():
+    st.title("📈 Inas Investing — Collated App")
+    st.caption("Live updates • Gold tracking • Rebalance advisor • Alerts • Google Sheets persistence • Lag compensation")
+
+    if st.session_state.last_update:
+        age_min = (_now_aware() - st.session_state.last_update).total_seconds() / 60.0
+        badge = "🔴 Stale" if age_min > 10 else ("🟠 Aging" if age_min > 5 else "🟢 Fresh")
+        st.info(f"Last price update: **{st.session_state.last_update.isoformat()}** — Status: {badge}")
+    else:
+        st.warning("Prices not fetched yet. Use the **Refresh Prices** button.")
+
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("🔄 Refresh Prices", use_container_width=True):
+            maybe_fetch_prices(st.session_state.holdings_df, force=True)
+            st.experimental_rerun()
+    with cols[1]:
+        if st.button("💾 Save to Google Sheets (Holdings)", use_container_width=True):
+            ok = try_write_gsheets(st.session_state.holdings_df, "Holdings")
+            st.success("Saved to Google Sheets.") if ok else st.error("Could not save to Google Sheets.")
+    with cols[2]:
+        if st.button("📝 Save Locally", use_container_width=True):
+            save_local_json(LOCAL_HOLDINGS_PATH, st.session_state.holdings_df.to_dict(orient="records"))
+            save_local_json(LOCAL_TARGETS_PATH, st.session_state.targets)
+            save_local_json(LOCAL_ALERTS_PATH, st.session_state.alerts)
+            st.success("Saved holdings, targets, and alerts locally.")
+
+def section_home():
+    st.subheader("Overview & Allocation")
+    prices = maybe_fetch_prices(st.session_state.holdings_df, force=False)
+    df_vals = compute_portfolio_values(st.session_state.holdings_df, prices)
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.dataframe(df_vals, use_container_width=True)
+    with c2:
+        total = float(df_vals["MarketValue_AUD"].sum())
+        st.metric("Portfolio Value (AUD)", f"{total:,.2f}")
+        alloc_series = allocation(df_vals).sort_values(ascending=False)
+        st.write("**Allocation**")
+        st.bar_chart(alloc_series)
+
+def section_live_tracker():
+    st.subheader("Live Tracker with Lag Compensation")
+    st.caption("Shows latest prices and a simple extrapolation if data is stale.")
+
+    prices = maybe_fetch_prices(st.session_state.holdings_df, force=False)
+    df_vals = compute_portfolio_values(st.session_state.holdings_df, prices)
+
+    # Drift compensation per ticker if stale > 5 min
+    if st.session_state.last_update and (_now_aware() - st.session_state.last_update) > timedelta(minutes=5):
+        st.warning("Data appears stale. Applying drift compensation (+10min linear extrapolation).")
+        comp_prices = {}
+        for t, hist in st.session_state.price_cache.items():
+            comp_prices[t] = drift_compensation(hist, 10)
+        df_vals["Price_AUD"] = df_vals["Ticker"].map(comp_prices).fillna(df_vals["Price_AUD"])
+        df_vals["MarketValue_AUD"] = df_vals["Quantity"] * df_vals["Price_AUD"]
+
+    st.dataframe(df_vals, use_container_width=True)
+
+def section_gold_tracking():
+    st.subheader("Gold Tracking (Live + Manual)")
+    st.caption("Track exposure via GOLD.AX or enter manual spot price and ounces.")
+
+    prices = maybe_fetch_prices(st.session_state.holdings_df, force=False)
+    gold_tickers = [t for t in st.session_state.holdings_df["Ticker"].tolist() if "GOLD" in str(t).upper() or "XAU" in str(t).upper()]
+    default_gold_tkr = gold_tickers[0] if gold_tickers else "GOLD.AX"
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("**Live Gold via Ticker**")
+        gold_tkr = st.text_input("Gold Ticker (e.g., GOLD.AX or XAUUSD=X)", value=default_gold_tkr)
+        gold_px = prices.get(gold_tkr, np.nan)
+        st.metric(f"{gold_tkr} Price (AUD est.)", f"{gold_px:.2f}" if not np.isnan(gold_px) else "N/A")
+
+    with col2:
+        st.write("**Manual Gold Entry**")
+        manual_oz = st.number_input("Ounces held", min_value=0.0, value=0.0, step=0.1)
+        manual_spot = st.number_input("Manual Spot (AUD/oz)", min_value=0.0, value=0.0, step=1.0)
+        if manual_oz and manual_spot:
+            st.metric("Manual Gold Value (AUD)", f"{manual_oz * manual_spot:,.2f}")
+
+def section_rebalance():
+    st.subheader("Rebalance Advisor")
+    st.caption("Compares current allocation with targets and suggests buy/sell qty adjustments.")
+
+    prices = maybe_fetch_prices(st.session_state.holdings_df, force=False)
+    df_vals = compute_portfolio_values(st.session_state.holdings_df, prices)
+    cur_alloc = allocation(df_vals)
+    threshold = st.slider("Suggestion threshold (abs % diff)", 0.0, 0.1, 0.02, 0.005)
+
+    out = rebalance_suggestions(cur_alloc, st.session_state.targets, df_vals, threshold)
+    st.dataframe(out, use_container_width=True)
+
+def section_alerts():
+    st.subheader("Alerts")
+    st.caption("Set price and allocation alerts. Alerts are checked on refresh.")
+
+    prices = maybe_fetch_prices(st.session_state.holdings_df, force=False)
+    df_vals = compute_portfolio_values(st.session_state.holdings_df, prices)
+
+    # Editor
+    st.write("**Edit Alerts**")
+    tickers = st.session_state.holdings_df["Ticker"].astype(str).tolist()
+    selected = st.selectbox("Ticker", options=tickers)
+    cfg = st.session_state.alerts.get(selected, {})
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        pa = st.number_input("Price Above", value=float(cfg.get("price_above", 0.0)), step=1.0)
+    with c2:
+        pb = st.number_input("Price Below", value=float(cfg.get("price_below", 0.0)), step=1.0)
+    with c3:
+        aa = st.number_input("Alloc Above (0-1)", value=float(cfg.get("alloc_above", 0.0)), step=0.01)
+    with c4:
+        ab = st.number_input("Alloc Below (0-1)", value=float(cfg.get("alloc_below", 0.0)), step=0.01)
+
+    if st.button("Save Alert"):
+        st.session_state.alerts[selected] = {
+            "price_above": pa if pa > 0 else None,
+            "price_below": pb if pb > 0 else None,
+            "alloc_above": aa if aa > 0 else None,
+            "alloc_below": ab if ab > 0 else None,
+        }
+        save_local_json(LOCAL_ALERTS_PATH, st.session_state.alerts)
+        st.success("Alert saved.")
+
+    # Evaluation
+    notes = evaluate_alerts(df_vals, st.session_state.targets, st.session_state.alerts)
+    st.write("**Alert Feed**")
+    if notes:
+        for n in notes:
+            st.warning(n)
+    else:
+        st.info("No alerts currently triggered.")
+
+def section_data():
+    st.subheader("Data — Edit Holdings / Targets")
+
+    st.write("**Holdings**")
+    st.caption("Edit your holdings below. Use valid ticker symbols for live pricing via yfinance.")
+    st.session_state.holdings_df = st.data_editor(
+        st.session_state.holdings_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("**Targets**")
+    # Build a table-like editor for targets
+    tickers = st.session_state.holdings_df["Ticker"].astype(str).tolist()
+    tgt_vals = {t: float(st.session_state.targets.get(t, 0.0)) for t in tickers}
+    cols = st.columns(3)
+    parts = [("Begin", tickers[::3]), ("Mid", tickers[1::3]), ("End", tickers[2::3])]
+    updated = {}
+    for col, (_, bucket) in zip(cols, parts):
+        with col:
+            for t in bucket:
+                updated[t] = st.number_input(f"Target for {t}", min_value=0.0, max_value=1.0, value=tgt_vals.get(t, 0.0), step=0.01, key=f"tgt_{t}")
+
+    if st.button("Save Targets"):
+        st.session_state.targets = updated
+        save_local_json(LOCAL_TARGETS_PATH, updated)
+        st.success("Targets saved.")
+
+def section_settings():
+    st.subheader("Settings — Google Sheets & Persistence")
+    st.markdown("""
+Configure Streamlit Secrets for Google Sheets to persist your holdings:
+
+```toml
+# .streamlit/secrets.toml
+[gcp_service_account]
+type = "service_account"
+project_id = "YOUR_PROJECT_ID"
+private_key_id = "YOUR_KEY_ID"
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "YOUR_SA_EMAIL@YOUR_PROJECT_ID.iam.gserviceaccount.com"
+client_id = "YOUR_CLIENT_ID"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+client_x509_cert_url = "..."
+
+[gsheets]
+sheet_id = "YOUR_SHEET_ID"
+worksheet = "Holdings"
+```
+Then use the **Save to Google Sheets** button in the header.
+    """)
+
+    st.write("**Local Persistence**")
+    st.code(f"holdings.json • targets.json • alerts.json", language="bash")
+
+def section_help():
+    st.subheader("Help")
+    st.markdown("""
+**What's inside this collated app?**
+
+- **Live Updates** via `yfinance`
+- **Allocation Chart** (Home)
+- **Gold Tracking** (Live ticker or manual ounces & spot)
+- **Rebalance Advisor** (suggest Qty adjustments to move toward targets)
+- **Alerts System** (price/alloc thresholds)
+- **Lag Compensation** (simple linear extrapolation when data is stale)
+- **Google Sheets Integration** (optional)
+
+**Deploy on Streamlit Cloud**
+1. Upload these files to a public GitHub repo.
+2. On Streamlit Cloud, set the app to run `app.py`.
+3. In **Advanced settings**, add your **secrets** (copy from `.streamlit/secrets.toml.template`).
+4. Deploy.
+
+**Local Run**
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+    """)
+
+# -----------------------------
+# Render
+# -----------------------------
+
+ui_header()
+
+if section == "Home — Overview & Allocation":
+    section_home()
+elif section == "Live Tracker (with Lag Compensation)":
+    section_live_tracker()
+elif section == "Gold Tracking (Live + Manual)":
+    section_gold_tracking()
+elif section == "Rebalance Advisor":
+    section_rebalance()
+elif section == "Alerts":
+    section_alerts()
+elif section == "Data — Edit Holdings / Targets":
+    section_data()
+elif section == "Settings — Google Sheets & Persistence":
+    section_settings()
+else:
+    section_help()
